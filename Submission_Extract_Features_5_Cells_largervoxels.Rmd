@@ -1,0 +1,404 @@
+---
+title: "Extract_Features_5_Cells"
+author: "Sizun Jiang"
+date: "1/28/2019"
+output: html_document
+---
+
+This markdown will do the following:
+1. Extract feature counts with a sliding window across 5 cells
+2. Sample across 5 cells to perform dimension reduction assays
+3. Plot pretty pictures
+```{r, include=FALSE, echo = FALSE}
+library(bioimagetools)
+library(ggplot2)
+library(gplots)
+# library(umap)
+library(Rtsne)
+library(RColorBrewer)
+library(gridExtra)
+library(spatstat)
+source("srIBI_functions.R")
+library(parallel)
+library("fastcluster")
+```
+
+## Read in cells
+```{r}
+cells = c("Cell1", "Cell2", "Cell3", "Cell4", "Cell5")
+# Load tiffs
+cells_tiffs = lapply(cells, function(cell){
+  tiffs = list.files(paste0(cell, "/TIFsNoBg/"), pattern = "*.tiff")
+  names(tiffs) = unlist(strsplit(tiffs, split = ".tiff"))
+  cell_combined = lapply(tiffs, function(tiff){
+  cell_tiff = readTIF(paste0(cell, "/TIFsNoBg/", tiff), as.is = T)
+})
+  return(cell_combined)
+})
+names(cells_tiffs) = cells
+```
+Lets look at the images to make sure legit, summing all 20 stacks
+```{r, fig.width=5, fig.height=5, dpi=300}
+lapply(cells_tiffs, function(cells){
+  lapply(cells, function(tiff){
+  img(tiff[,,1:20], up = 1)
+})
+})
+
+```
+
+## Feature Extraction
+Now lets do a pixel extraction of X by Y by Z size
+Note this part is multicore
+```{r}
+x = 10
+y = 10
+z = 5
+step_xy = 5
+step_z = 3
+discard = 100
+cells_features = mclapply(cells_tiffs, function(cell_tiff){
+  extract_features(cell_tiff, x = x, y = y, z = z, step_xy = step_xy, step_z = step_z, discard = discard)
+}, mc.cores = 8)
+```
+
+Sanity check. Plots all the features
+```{r, fig.width=5, fig.height=5, dpi=300}
+dim_xy = floor((1024-x)/step_xy)
+
+lapply(cells_features, function(ext_features){
+  test_df = ext_features$`19F-Nucleolin`
+  img(t(matrix(test_df$`19F-Nucleolin`[test_df$z_start == 1], 
+               sqrt(length(test_df$`19F-Nucleolin`[test_df$z_start == 1])),
+               sqrt(length(test_df$`19F-Nucleolin`[test_df$z_start == 1])))))
+})
+```
+Concatenate DFs and get log2
+```{r}
+cells_log2_all_features = lapply(cells_features, function(ext_features){
+  all_features = do.call(cbind, lapply(ext_features, function(feat){
+  return(feat[,2])
+  }))
+  log2_all_features_df = cbind(ext_features[[1]][,-2], log2(all_features+0.0001))
+})
+```
+
+# Sample and cluster
+```{r}
+set.seed(123456)
+# Number to sample per cell
+sample_num = 20000
+subset_cells = do.call(rbind, lapply(names(cells_log2_all_features), function(cell){
+   sample_cells(cells_log2_all_features[[cell]], sample_num = sample_num, cellID = cell)
+}))
+
+
+# Use all channels but 12C and SED
+data.tsne = Rtsne(subset_cells[,c(8, 10:14)], check_duplicates = F, num_threads = 8)
+df.tsne.input = (subset_cells[,c(8, 10:14)])
+df.tsne = as.data.frame(data.tsne$Y)
+# Plot
+plot(data.tsne$Y,asp=1) # Plot the result
+```
+
+# Clustering of the pixels/boxes (131220 voxels per cell)
+# Note that you'll need a lot of ram for this
+```{r}
+mycolors = c(brewer.pal(name = "Set1", 9), brewer.pal(name="Set3", 12), brewer.pal(name="Set2", 8))
+df.tsne.clust = df.tsne
+cluster_k_results = lapply(3:30, function(k){
+  return(kmeans(scale(df.tsne), k))
+})
+names(cluster_k_results) = 3:30
+cluster_h_results = hclust(dist(scale(df.tsne)))
+```
+
+
+
+```{r, fig.width=15, fig.height=8, dpi=300}
+for(k in 3:24){
+  df.tsne.clust$cl_kmeans = factor(cluster_k_results[[as.character(k)]][["cluster"]])
+  df.tsne.clust$cl_hierarchical = factor(cutree(cluster_h_results, k=k))
+  plot_k1=plot_cluster_multicolor(df.tsne.clust, "cl_kmeans", mycolors)
+  plot_h1=plot_cluster_multicolor(df.tsne.clust, "cl_hierarchical", mycolors)
+  grid.arrange(plot_k1, plot_h1, ncol=2)
+}
+```
+Lets color the tSNE map by expression
+```{r,  fig.width=8, fig.height=12, dpi=300}
+# Channel info
+df_channels = do.call(cbind, lapply(colnames(df.tsne.input[1:6]), function(x){
+  ch = scale(df.tsne.input[[x]], center = T)
+  return(ch)
+}))
+colnames(df_channels) = c("H3K27ac", "Cisplatin", "SC35", "Nucleolin", "DNA", "H3K9me3")
+df.tsne.clust_range = cbind(df.tsne.clust, df_channels)
+```
+
+
+Extract cluster info per cluster. Median
+```{r, fig.width=8, fig.height=5, dpi=300}
+
+for(k in 29:29){
+  df.tsne.input$cl_hierarachical = factor(cutree(cluster_h_results, k=k))
+  hierarachical_ave = aggregate(df.tsne.input[1:6], list(df.tsne.input$cl_hierarachical), FUN = median)
+  require(gplots)
+  col = colorRampPalette(c("blue","white","red"))(256)
+  hm_h = heatmap.2(t(as.matrix(hierarachical_ave[,2:7])), scale = "row", col = col,
+            sepwidth=c(0.01,0.01), sepcolor = "black", colsep=1:ncol(t(as.matrix(hierarachical_ave[,2:7]))),rowsep=1:nrow(t(as.matrix(hierarachical_ave[,2:7]))),
+            density.info="none", trace="none", margins=c(3,12), main = paste0("Hierarchical Clustering, k =", k))
+}
+```
+
+Use mean here
+```{r, fig.width=8, fig.height=5, dpi=300}
+
+for(k in 29:29){
+  df.tsne.input$cl_hierarachical = factor(cutree(cluster_h_results, k=k))
+  hierarachical_ave = aggregate(df.tsne.input[1:6], list(df.tsne.input$cl_hierarachical), FUN = mean)
+  require(gplots)
+  col = colorRampPalette(c("blue","white","red"))(256)
+  hm_h = heatmap.2(t(as.matrix(hierarachical_ave[,2:7])), scale = "row", col = col,
+            sepwidth=c(0.01,0.01), sepcolor = "black", colsep=1:ncol(t(as.matrix(hierarachical_ave[,2:7]))),rowsep=1:nrow(t(as.matrix(hierarachical_ave[,2:7]))),
+            density.info="none", trace="none", margins=c(3,12), main = paste0("Hierarchical Clustering, k =", k))
+}
+```
+
+| Mean, k = 29             |                                   |                 |
+| ------------------------ | --------------------------------- | --------------- |
+| Annotation               | Clusters                          | New cluster Num |
+| Heterochromatin 1        | 1, 5                              | 1               |
+| Heterochromatin 2        | 13, 27                            | 2               |
+| Euchromatin 1            | 11                                | 3               |
+| Euchromatin 2            | 16, 19                            | 4               |
+| Euchromatin + cisplatin  | 3, 18                             | 5               |
+| SC35 + Ac + Cisplatin    | 4, 7, 10                          | 6               |
+| SC35, me3 + Ac           | 25                                | 7               |
+| SC35                     | 6, 9                              | 8               |
+| Nucleolin low cisplatin  | 2, 12, 14, 15, 17, 23, 24, 26, 28 | 9               |
+| Nucleolin high cisplatin | 22                                | 10              |
+| Toss                     | 20, 21, 29                        | 11              |
+
+1. Heat maps after combining
+2. Tsne after combining
+
+```{r}
+k = 29
+df.tsne.input$cl_hierarachical = factor(cutree(cluster_h_results, k=k))
+new_cl_hierarachical = factor(cutree(cluster_h_results, k=k))
+w1 = which(new_cl_hierarachical == 1| new_cl_hierarachical == 5)
+w2 = which(new_cl_hierarachical == 13| new_cl_hierarachical == 27)
+w3 = which(new_cl_hierarachical == 11)
+w4 = which(new_cl_hierarachical == 16| new_cl_hierarachical == 19)
+w5 = which(new_cl_hierarachical == 3| new_cl_hierarachical == 18)
+w6 = which(new_cl_hierarachical == 4| new_cl_hierarachical == 7| new_cl_hierarachical == 10)
+w7 = which(new_cl_hierarachical == 25)
+w8 = which(new_cl_hierarachical == 6| new_cl_hierarachical == 9)
+w9 = which(new_cl_hierarachical == 2| new_cl_hierarachical == 12| new_cl_hierarachical == 14| new_cl_hierarachical == 15| new_cl_hierarachical == 17| new_cl_hierarachical == 23| new_cl_hierarachical == 24| new_cl_hierarachical == 26| new_cl_hierarachical == 28)
+w10 = which(new_cl_hierarachical == 22)
+w11 = which(new_cl_hierarachical == 20| new_cl_hierarachical == 21| new_cl_hierarachical == 29)
+new_cl_hierarachical[w1] = 1
+new_cl_hierarachical[w2] = 2
+new_cl_hierarachical[w3] = 3
+new_cl_hierarachical[w4] = 4
+new_cl_hierarachical[w5] = 5
+new_cl_hierarachical[w6] = 6
+new_cl_hierarachical[w7] = 7
+new_cl_hierarachical[w8] = 8
+new_cl_hierarachical[w9] = 9
+new_cl_hierarachical[w10] = 10
+new_cl_hierarachical[w11] = 11
+df.tsne.input$new_cl_hierarachical = factor(new_cl_hierarachical)
+table(df.tsne.input$new_cl_hierarachical)
+
+hierarachical_median = aggregate(df.tsne.input[1:6], list(df.tsne.input$new_cl_hierarachical), FUN = mean)
+col = colorRampPalette(c("blue","white","red"))(256)
+hm_h = heatmap.2(t(as.matrix(hierarachical_median[,2:7])), scale = "row", col = col,
+          sepwidth=c(0.01,0.01), sepcolor = "black", colsep=1:ncol(t(as.matrix(hierarachical_median[,2:7]))),rowsep=1:nrow(t(as.matrix(hierarachical_median[,2:7]))),
+          density.info="none", trace="none", margins=c(3,12), main = paste0("Hierarchical Clustering"))
+```
+
+Plot combined clusters
+```{r, fig.width=12, fig.height=15, dpi=300}
+df.tsne.clust$cl_hierarachical = df.tsne.input$cl_hierarachical
+df.tsne.clust$new_cl_hierarachical = df.tsne.input$new_cl_hierarachical
+plot_h_old=plot_cluster_multicolor(df.tsne.clust, "cl_hierarachical", mycolors)
+plot_h_combined=plot_cluster_multicolor(df.tsne.clust, "new_cl_hierarachical", mycolors)
+grid.arrange(plot_gradient(df.tsne.clust_range , "H3K27ac"), 
+           plot_gradient(df.tsne.clust_range, "Cisplatin"),
+           plot_gradient(df.tsne.clust_range, "SC35"),
+           plot_gradient(df.tsne.clust_range, "Nucleolin"),
+           plot_gradient(df.tsne.clust_range, "DNA"),
+           plot_gradient(df.tsne.clust_range, "H3K9me3"),
+           plot_h_old,
+           plot_h_combined,
+           ncol=3, nrow=3)
+```
+
+
+```{r, fig.width=8, fig.height=9, dpi=300}
+mycolors2 = c(brewer.pal(name = "Set3", 11 ), brewer.pal(name = "Set1", 9)[7])
+plot_cluster_multicolor(df.tsne.clust, "new_cl_hierarachical", mycolors2)
+```
+
+Permutation test implemented for more stringent testing of neighborhoods:
+
+Pairwise interactions between and within cell phenotypes are compared to a random distribution using two individual one-tailed permutation tests (equation (1)). These provide two P values which correspond to either interaction or avoidance. These P values represent the likelihood of a neighborhood interaction being enriched or depleted in comparison to a randomized version of the same tissue. The comparison to a matched randomized tissue for every individual image controls for both the distinct connectivity and the specific cell types in that tissue. Equation (1) describes our approach using a permutation test with Monte Carlo sampling. We run this test twice to calculate the P value for each tail.
+
+Nearest Neighbor Permutation Test
+```{r}
+subset_cells$h_cluster = df.tsne.input$new_cl_hierarachical
+# Permutation test
+
+perm_6_10 = perm_AB(subset_cells, namA=6, namB=10, radius=5, n=1000, mc.cores = 38)
+# Plot for permutation test between for cluster 6's assocaition with cluster 10
+lapply(cells, function(cell){
+  perm_6_10$plots[[cell]]
+})
+
+# Pvalue that interaction is far lower than expected by random
+perm_6_10$adj.pval
+# Log2 Fold Change over mean of perm test
+perm_6_10$log2FC
+```
+Perform a pairwise test for all 11 clusters against each other. Try diff rad
+Done:5, 25
+Doing: for c(1,2,5,10,25,50)
+```{r}
+clusters = sort(unique(subset_cells$h_cluster), decreasing = F)
+names(clusters) = clusters
+pairwise_perm_test_all = lapply(c(1,2,5,10,25,50), function(i){
+  print(i)
+  pairwise_perm_test = lapply(clusters, function(A){
+  AtoB_perm_test = mclapply(clusters, function(B){
+    perm_AB(subset_cells, namA=A, namB=B, radius=i, n=1000, mc.cores = 20)
+    })
+  })
+})
+# Names is radius
+names(pairwise_perm_test_all) = c(1,2,5,10,25,50)
+
+
+# pairwise_perm_test_5rad_named = lapply(pairwise_perm_test_5rad, function(clust){
+#   names(clust) = clusters
+#   return(clust)
+# })
+
+save(pairwise_perm_test_all, file = "pairwise_perm_test_all.list")
+```
+
+# See if there is a trend in different radius
+c(1,2,5,10,20,25,30,50,100)
+```{r, fig.width=8, fig.height=6, dpi=300}
+pairwise_plots = lapply(names(pairwise_perm_test_all), function(x){
+  perm_matrix = matrix(nrow = length(clusters), ncol = length(clusters))
+  for(i in 1:length(clusters)){
+    for(j in 1:length(clusters)){
+      perm_matrix[i,j] = pairwise_perm_test_all[[x]][[i]][[j]]$log2FC
+    }
+  }
+# No clustering
+heatmap.2(perm_matrix, scale = "row", col = col, Rowv = F, Colv = F,
+          sepwidth=c(0.01,0.01), sepcolor = "black", colsep=1:ncol(perm_matrix[,1:11]),rowsep=1:nrow(perm_matrix[,1:11]),
+          density.info="none", trace="none", margins=c(3,12), main = paste0("Interaction Frequency Radius = ", x),
+          key.xlab="Log2FC")
+  
+})
+
+```
+
+Plot Heatmap rad = 5
+```{r, fig.width=8, fig.height=6, dpi=300}
+perm_matrix = matrix(nrow = length(clusters), ncol = length(clusters))
+for(i in 1:length(clusters)){
+  for(j in 1:length(clusters)){
+    perm_matrix[i,j] = pairwise_perm_test_5rad_named[[i]][[j]]$log2FC
+  }
+}
+
+# No clustering
+# heatmap.2(perm_matrix, Rowv = F, Colv = F, dendrogram = "none", symm = T)
+heatmap.2(perm_matrix, scale = "row", col = col, Rowv = F, Colv = F,
+          sepwidth=c(0.01,0.01), sepcolor = "black", colsep=1:ncol(perm_matrix[,1:11]),rowsep=1:nrow(perm_matrix[,1:11]),
+          density.info="none", trace="none", margins=c(3,12), main = paste0("Interaction Frequency"),
+          key.xlab="Log2FC")
+
+# Clustered
+heatmap.2(perm_matrix, scale = "row", col = col, Rowv = T, symm=T,
+          sepwidth=c(0.01,0.01), sepcolor = "black", colsep=1:ncol(perm_matrix[,1:11]),rowsep=1:nrow(perm_matrix[,1:11]),
+          density.info="none", trace="none", margins=c(3,12), main = paste0("Interaction Frequency"),
+          key.xlab="Log2FC")
+
+# Get matrix of pvalues, mean adjusted P
+pval_matrix = matrix(nrow = length(clusters), ncol = length(clusters))
+for(i in 1:length(clusters)){
+  for(j in 1:length(clusters)){
+    pval_matrix[i,j] = mean(pairwise_perm_test_5rad_named[[i]][[j]]$adj.pval)
+  }
+}
+
+pval_matrix_binary = pval_matrix
+pval_matrix_binary= (pval_matrix_binary < 0.05)*1
+heatmap.2(pval_matrix_binary, scale = NULL, Rowv = F, symm=T,
+          sepwidth=c(0.01,0.01), sepcolor = "black", colsep=1:ncol(pval_matrix[,1:11]),rowsep=1:nrow(pval_matrix[,1:11]),
+          density.info="none", trace="none", margins=c(3,12), main = paste0("Pval of Interaction Frequency"),
+          key.xlab="Significant (1) or Not (0)")
+
+```
+
+Plot Heatmap rad = 25
+```{r, fig.width=8, fig.height=6, dpi=300}
+perm_matrix = matrix(nrow = length(clusters), ncol = length(clusters))
+for(i in 1:length(clusters)){
+  for(j in 1:length(clusters)){
+    perm_matrix[i,j] = pairwise_perm_test_25rad[[i]][[j]]$log2FC
+  }
+}
+
+# No clustering
+# heatmap.2(perm_matrix, Rowv = F, Colv = F, dendrogram = "none", symm = T)
+heatmap.2(perm_matrix, scale = "row", col = col, Rowv = F, Colv = F,
+          sepwidth=c(0.01,0.01), sepcolor = "black", colsep=1:ncol(perm_matrix[,1:11]),rowsep=1:nrow(perm_matrix[,1:11]),
+          density.info="none", trace="none", margins=c(3,12), main = paste0("Interaction Frequency"),
+          key.xlab="Log2FC")
+
+# Clustered
+heatmap.2(perm_matrix, scale = "row", col = col, Rowv = T, symm=T,
+          sepwidth=c(0.01,0.01), sepcolor = "black", colsep=1:ncol(perm_matrix[,1:11]),rowsep=1:nrow(perm_matrix[,1:11]),
+          density.info="none", trace="none", margins=c(3,12), main = paste0("Interaction Frequency"),
+          key.xlab="Log2FC")
+
+# Get matrix of pvalues, mean adjusted P
+pval_matrix = matrix(nrow = length(clusters), ncol = length(clusters))
+for(i in 1:length(clusters)){
+  for(j in 1:length(clusters)){
+    pval_matrix[i,j] = mean(pairwise_perm_test_25rad[[i]][[j]]$adj.pval)
+  }
+}
+
+pval_matrix_binary = pval_matrix
+pval_matrix_binary= (pval_matrix_binary < 0.05)*1
+heatmap.2(pval_matrix_binary, scale = NULL, Rowv = F, symm=T,
+          sepwidth=c(0.01,0.01), sepcolor = "black", colsep=1:ncol(pval_matrix[,1:11]),rowsep=1:nrow(pval_matrix[,1:11]),
+          density.info="none", trace="none", margins=c(3,12), main = paste0("Pval of Interaction Frequency"),
+          key.xlab="Significant (1) or Not (0)")
+
+```
+
+
+
+```{r}
+channel_plots = lapply(colnames(subset_cells)[8:15], function(i){
+  plot_marker_dist(cluster_list = cluster_list, channel_name = i)
+})
+names(channel_plots) = colnames(subset_cells)[8:15]
+
+channel_plots[[1]]
+channel_plots[[2]]
+channel_plots[[3]]
+channel_plots[[4]]
+channel_plots[[5]]
+channel_plots[[6]]
+channel_plots[[7]]
+# plot_marker_dist(cluster_list = cluster_list, channel_name = '194Pt-Cisplatin', whisker_cutoff = 1.05)
+```
