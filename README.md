@@ -1,6 +1,6 @@
 # HD-MIBI
 Code and Data accompanying the HD-MIBI paper
-
+https://www.nature.com/articles/s41467-021-24822-1
 
 ### 1. System requirements
 
